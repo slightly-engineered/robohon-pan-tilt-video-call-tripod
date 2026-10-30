@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>RoboVidCall</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; background: #000;
+    font-family: -apple-system, sans-serif; overflow: hidden;
+  }
+  /* The robot only RECEIVES, so the only video on this page is your own
+     camera - shown full-screen so you can frame what the robot displays. */
+  #localVideo {
+    width: 100%; height: 100%; object-fit: cover; background: #000;
+  }
+  #localVideo.mirror { transform: scaleX(-1); }
+  #status {
+    position: absolute; left: 12px; right: 12px;
+    top: calc(env(safe-area-inset-top, 0px) + 12px);
+    color: #fff; font-size: 14px; text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+  }
+  #buttons {
+    position: absolute; left: 0; right: 0;
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 24px);
+    display: flex; justify-content: center; gap: 16px;
+  }
+  button {
+    padding: 14px 26px; font-size: 17px; border-radius: 12px; border: none; color: #fff;
+  }
+  #joinBtn { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+             padding: 16px 32px; font-size: 20px; background: #2ecc71; }
+  #hangupBtn { background: #e74c3c; display: none; }
+  #flipBtn { background: rgba(255,255,255,0.25); display: none; }
+</style>
+</head>
+<body>
+
+<video id="localVideo" autoplay playsinline muted></video>
+<div id="status">Not connected</div>
+<button id="joinBtn">Join Call</button>
+<div id="buttons">
+  <button id="flipBtn">Flip camera</button>
+  <button id="hangupBtn">Hang up</button>
+</div>
+
+<script>
+// Nothing to edit: when this page is served by signaling-server/server.js
+// it connects back to the same host it was loaded from (wss:// on https).
+// Only if you host this file somewhere else, set an override here:
+const SIGNALING_SERVER_URL_OVERRIDE = "";   // e.g. "wss://<your-PC-LAN-IP>:8443"
+const ROOM_NAME = "robohon";
+
+// The robot is a weak decoder: keep what we send modest.
+const SEND_AUDIO = true;            // robot plays your voice; set false for video only
+const MAX_VIDEO_BITRATE = 800000;   // bits/sec cap on the outgoing video
+const VIDEO_CONSTRAINTS = { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 20, max: 24 } };
+
+const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
+
+let ws = null;
+let pc = null;
+let myId = null;
+let broadcasterId = null;
+let localStream = null;
+let facing = "user";
+let wantConnected = false;          // false after Hang up -> no auto-reconnect
+let reconnectTimer = null;
+let pendingCandidates = [];         // candidates that arrived before the offer was applied
+let remoteDescSet = false;
+
+const statusEl = document.getElementById("status");
+const localVideo = document.getElementById("localVideo");
+const joinBtn = document.getElementById("joinBtn");
+const hangupBtn = document.getElementById("hangupBtn");
+const flipBtn = document.getElementById("flipBtn");
+
+function setStatus(text) { statusEl.textContent = text; }
+
+function signalingUrl() {
+  if (SIGNALING_SERVER_URL_OVERRIDE) return SIGNALING_SERVER_URL_OVERRIDE;
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  return scheme + "://" + location.host;
+}
+
+async function openCamera() {
+  const audio = SEND_AUDIO ? true : false;
+  const video = Object.assign({ facingMode: facing }, VIDEO_CONSTRAINTS);
+  try {
+    return await navigator.mediaDevices.getUserMedia({ video, audio });
+  } catch (e) {
+    if (audio) {                     // mic denied/unavailable -> still send video
+      return await navigator.mediaDevices.getUserMedia({ video, audio: false });
+    }
+    throw e;
+  }
+}
+
+function showLocal() {
+  localVideo.srcObject = localStream;
+  localVideo.classList.toggle("mirror", facing === "user");
+  localVideo.play().catch(() => {});
+}
+
+async function join() {
+  joinBtn.style.display = "none";
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus("Camera blocked: this page is not HTTPS. Open https://<PC-IP>:8443/ " +
+              "(accept the certificate warning once).");
+    joinBtn.style.display = "block";
+    return;
+  }
+  if (!SIGNALING_SERVER_URL_OVERRIDE && !location.host) {
+    setStatus("Open this page from the signaling server (https://<PC-IP>:8443/), not as a local file.");
+    joinBtn.style.display = "block";
+    return;
+  }
+
+  try {
+    localStream = await openCamera();
+  } catch (e) {
+    setStatus("Camera permission denied: " + e.message);
+    joinBtn.style.display = "block";
+    return;
+  }
+  showLocal();
+
+  wantConnected = true;
+  hangupBtn.style.display = "inline-block";
+  flipBtn.style.display = "inline-block";
+  connectSignaling();
+}
+
+function connectSignaling() {
+  clearTimeout(reconnectTimer);
+  ws = new WebSocket(signalingUrl());
+
+  ws.onopen = () => {
+    setStatus("Connected to server, joining room...");
+    send({ type: "join", room: ROOM_NAME, role: "viewer" });
+  };
+
+  ws.onmessage = (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch (e) { return; }
+    handleMessage(msg);
+  };
+
+  ws.onerror = () => setStatus("Signaling connection error (is the server running? did you accept the certificate?)");
+
+  ws.onclose = () => {
+    if (!wantConnected) return;
+    setStatus("Disconnected from server, retrying...");
+    closePeer();
+    reconnectTimer = setTimeout(connectSignaling, 2000);
+  };
+}
+
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function closePeer() {
+  if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+  pendingCandidates = [];
+  remoteDescSet = false;
+}
+
+function handleMessage(msg) {
+  switch (msg.type) {
+    case "joined":
+      myId = msg.id;
+      setStatus("Joined (id " + myId + "). Waiting for the robot...");
+      break;
+
+    case "no-broadcaster":
+      setStatus("Robot isn't online yet (waiting - it will call as soon as it starts).");
+      break;
+
+    case "broadcaster-available":
+      setStatus("Robot found, waiting for it to call...");
+      break;
+
+    case "offer":
+      broadcasterId = msg.from;
+      handleOffer(msg.sdp).catch((e) => setStatus("Call setup failed: " + e.message));
+      break;
+
+    case "candidate":
+      if (!msg.candidate) break;
+      if (pc && remoteDescSet) addCandidate(msg.candidate);
+      else pendingCandidates.push(msg.candidate);   // offer not applied yet - hold it
+      break;
+
+    case "peer-left":
+      setStatus("Robot disconnected. Waiting for it to come back...");
+      closePeer();
+      break;
+  }
+}
+
+function addCandidate(c) {
+  pc.addIceCandidate(new RTCIceCandidate({
+    sdpMid: c.sdpMid,
+    sdpMLineIndex: c.sdpMLineIndex,
+    candidate: c.candidate
+  })).catch(() => {});
+}
+
+async function handleOffer(sdp) {
+  closePeer();                                   // a new offer replaces any old call
+  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  const thisPc = pc;
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      send({
+        type: "candidate",
+        room: ROOM_NAME,
+        to: broadcasterId,
+        candidate: {
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+          candidate: event.candidate.candidate
+        }
+      });
+    }
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    if (pc !== thisPc) return;
+    const s = pc.iceConnectionState;
+    if (s === "connected" || s === "completed") setStatus("On call - robot is showing your camera");
+    else if (s === "failed") setStatus("Connection failed (network/firewall?)");
+    else if (s === "disconnected") setStatus("Connection interrupted...");
+  };
+
+  // The robot's offer is receive-only, so nothing comes back on this page.
+  // Attach our camera/mic AFTER applying the offer so they reuse its m-lines.
+  await pc.setRemoteDescription({ type: "offer", sdp: sdp });
+  remoteDescSet = true;
+  localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+
+  const queued = pendingCandidates; pendingCandidates = [];
+  queued.forEach(addCandidate);
+
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  send({ type: "answer", room: ROOM_NAME, to: broadcasterId, sdp: answer.sdp });
+
+  capBitrate(thisPc);
+}
+
+async function capBitrate(targetPc) {
+  try {
+    for (const sender of targetPc.getSenders()) {
+      if (!sender.track || sender.track.kind !== "video") continue;
+      const params = sender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+      params.encodings[0].maxBitrate = MAX_VIDEO_BITRATE;
+      await sender.setParameters(params);
+    }
+  } catch (e) { /* best effort - not all Safari versions allow it */ }
+}
+
+async function flipCamera() {
+  const nextFacing = facing === "user" ? "environment" : "user";
+  try {
+    const old = localStream;
+    facing = nextFacing;
+    const fresh = await openCamera();
+    const newVideo = fresh.getVideoTracks()[0];
+    if (pc) {
+      const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
+      if (sender) await sender.replaceTrack(newVideo);
+    }
+    // keep the existing audio track so the call isn't interrupted
+    const oldAudio = old.getAudioTracks()[0];
+    fresh.getAudioTracks().forEach((t) => t.stop());
+    localStream = new MediaStream([newVideo].concat(oldAudio ? [oldAudio] : []));
+    old.getVideoTracks().forEach((t) => t.stop());
+    showLocal();
+  } catch (e) {
+    facing = nextFacing === "user" ? "environment" : "user";
+    setStatus("Couldn't switch camera: " + e.message);
+  }
+}
+
+function hangUp() {
+  wantConnected = false;
+  clearTimeout(reconnectTimer);
+  send({ type: "leave", room: ROOM_NAME });
+  closePeer();
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  if (localStream) { localStream.getTracks().forEach((t) => t.stop()); localStream = null; }
+  localVideo.srcObject = null;
+  hangupBtn.style.display = "none";
+  flipBtn.style.display = "none";
+  joinBtn.style.display = "block";
+  setStatus("Call ended.");
+}
+
+joinBtn.addEventListener("click", join);
+hangupBtn.addEventListener("click", hangUp);
+flipBtn.addEventListener("click", flipCamera);
+</script>
+
+</body>
+</html>

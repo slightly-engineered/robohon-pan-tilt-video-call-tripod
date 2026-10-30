@@ -1,0 +1,13 @@
+{
+  "name": "robovidcall-signaling",
+  "version": "1.0.0",
+  "description": "Minimal WebRTC signaling relay for RoboVidCall (Android broadcaster <-> iPhone/browser viewers)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "selfsigned": "^5.5.0",
+    "ws": "^8.18.0"
+  }
+}

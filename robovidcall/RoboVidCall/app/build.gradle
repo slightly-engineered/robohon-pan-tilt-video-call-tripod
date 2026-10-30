@@ -1,0 +1,55 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.colson.robovidcall'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.colson.robovidcall"
+        // minSdk 21 matches the MSM8926 / Android 5.0.2 RoboHon board this
+        // is meant to run on. Raise this if you're building for a newer device.
+        minSdk 21
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+
+    // WebRTC. This exact coordinate has moved around over the years as
+    // Google stopped publishing prebuilt AARs directly. If this one 404s
+    // when Gradle syncs, swap it for:
+    //   implementation 'io.github.webrtc-sdk:android:125.6422.06.1'
+    // The package name is still org.webrtc.* either way, so no code
+    // changes are needed if you switch coordinates.
+    implementation 'io.github.webrtc-sdk:android:125.6422.06.1'
+
+    // Plain WebSocket client for talking to the signaling server.
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+
+    // Camera capture goes through org.webrtc's own Camera2Enumerator /
+    // CameraVideoCapturer (bundled in the WebRTC dependency above) -
+    // no separate CameraX dependency needed, and it plugs straight into
+    // PeerConnectionFactory.createVideoSource() with no bridging code.
+}
