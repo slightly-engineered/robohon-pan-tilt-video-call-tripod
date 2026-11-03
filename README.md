@@ -1,4 +1,4 @@
-# RoBoHoN Pan/Tilt Video-Call Tripod
+# RoBoHoN Pan/Tilt PTZ Video-Call App Tripod
 
 A pan/tilt tripod head driven by two salvaged Sharp RoBoHoN servos, steered from
 a browser joystick, plus RoboVidCall: an Android WebRTC video-call app for
